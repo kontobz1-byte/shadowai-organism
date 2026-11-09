@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/img/shadowai_logo.png" alt="ShadowAI — Local · Sovereign · Made in Poland" width="560"></p>
+<p align="center"><img src="docs/img/shadowai_logo.png" alt="ShadowAI" width="220"></p>
 
 # ShadowAI — a distributed, local-first AI organism
 
