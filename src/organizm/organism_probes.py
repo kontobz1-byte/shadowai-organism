@@ -789,11 +789,41 @@ async def _syncthing() -> tuple[list[dict], list[str]]:
     return faults, notes
 
 
+# 2026-11-05: IG stał od 30.10 (12 rolek w needs_operator, w przeglądarce .10 złe konto), a sonda
+# patrzyła tylko na approved po terminie — kanal:instagram „ustąpiła”. Próby w oknie 7 dni +
+# ostatni PUBLISHED starszy niż 36 h = POSTÓJ, z jedną czynnością dla operatora wyczytaną z notes.
+KANAL_POSTOJ_S = 36 * 3600
+KANAL_OKNO_PROB_S = 7 * 86400
+_PRZYCZYNY_POSTOJU = (
+    ("konto", re.compile(r"kont[oa]\b|account|zalogowan\w*\s+jako|Operator\.", re.I),
+     "przełącz konto w przeglądarce na .10 na shadowai.online i ponów pozycje z needs_operator"),
+    ("logowanie", re.compile(r"logowa|zaloguj|login|log in|sign[ _-]?in|checkpoint", re.I),
+     "zaloguj się ponownie na konto kanału w przeglądarce na .10 (ściana logowania) i ponów"),
+    ("tablet", re.compile(r"tablet|timeout|time-out|limit czasu|\badb\b", re.I),
+     "obudź tablet i sprawdź połączenie ADB, potem ponów publikację"),
+)
+_CZYNNOSC_NIEZNANA = "przeczytaj notes ostatniej porażki w publication_queue i ponów ręcznie"
+
+
+def _czynnosc_postoju(notatki: list[str]) -> str:
+    licz: dict[str, int] = {}
+    for tekst in notatki:
+        for nazwa, rx, _ in _PRZYCZYNY_POSTOJU:
+            if rx.search(tekst or ""):
+                licz[nazwa] = licz.get(nazwa, 0) + 1
+                break
+    najlepsza, ile = _CZYNNOSC_NIEZNANA, 0
+    for nazwa, _, czynnosc in _PRZYCZYNY_POSTOJU:  # remis → kolejność listy
+        if licz.get(nazwa, 0) > ile:
+            najlepsza, ile = czynnosc, licz[nazwa]
+    return najlepsza
+
+
 def _kanaly(teraz: datetime) -> tuple[list[dict], list[str]]:
     con = sqlite3.connect(f"file:{PLIK_BAZY}?mode=ro", uri=True, timeout=3)
     try:
         rows = con.execute(
-            "SELECT channel, status, notes, scheduled_at FROM publication_queue WHERE status IN "
+            "SELECT channel, status, notes, scheduled_at, staged_at FROM publication_queue WHERE status IN "
             f"('published','approved','needs_operator') AND channel IN ({','.join('?' * len(KANALY_PUBLIKACJI))}) "
             "AND staged_at >= ?", (*KANALY_PUBLIKACJI, _iso(teraz - timedelta(days=90)))).fetchall()
     finally:
@@ -801,7 +831,8 @@ def _kanaly(teraz: datetime) -> tuple[list[dict], list[str]]:
     ostatnia: dict[str, datetime] = {}
     gotowe: dict[str, int] = {}
     blad: dict[str, int] = {}
-    for kanal, status, notes, sched in rows:
+    proby: dict[str, list[str]] = {}
+    for kanal, status, notes, sched, staged in rows:
         if status == "published":
             for d, g in _PUBLISHED.findall(notes or ""):
                 ts = _z_iso(f"{d}T{g or '00:00'}:00+00:00")
@@ -813,21 +844,33 @@ def _kanaly(teraz: datetime) -> tuple[list[dict], list[str]]:
                 gotowe[kanal] = gotowe.get(kanal, 0) + 1
         else:
             blad[kanal] = blad.get(kanal, 0) + 1
+            kiedy = _z_iso(staged)
+            if kiedy is not None and (teraz - kiedy).total_seconds() <= KANAL_OKNO_PROB_S:
+                proby.setdefault(kanal, []).append(str(notes or ""))
     faults: list[dict] = []
-    for kanal, n in sorted(gotowe.items()):
+    for kanal in sorted(set(gotowe) | set(proby)):
+        n = gotowe.get(kanal, 0)
         ost = ostatnia.get(kanal)
         cisza = (teraz - ost).total_seconds() if ost else None
-        if cisza is not None and cisza <= KANAL_STOI_S:
+        stoi_gotowe = kanal in gotowe and (cisza is None or cisza > KANAL_STOI_S)
+        postoj = kanal in proby and (cisza is None or cisza > KANAL_POSTOJ_S)
+        if not (stoi_gotowe or postoj):
             continue
+        ostatnia_txt = (f"{cisza / 3600:.0f} h temu ({_iso(ost)})" if ost else "— brak w 90 dniach")
+        if postoj:
+            evidence = (f"{kanal}: POSTÓJ — czynność: {_czynnosc_postoju(proby[kanal])}; "
+                        f"{len(proby[kanal])} prób w 7 dniach w needs_operator, ostatnia udana {ostatnia_txt}"
+                        + (f"; {n} gotowych do publikacji" if n else ""))
+        else:
+            evidence = (f"{kanal}: {n} gotowych do publikacji, a ostatnia udana " + ostatnia_txt
+                        + (f"; {blad[kanal]} czeka na operatora po błędzie ręki" if blad.get(kanal) else ""))
         faults.append(_fault(
             key=f"kanal:{kanal}", probe="ciaglosc", czesc="kanaly", kind="publish_channel_stalled",
             severity="high" if cisza is None or cisza > KANAL_STOI_HIGH_S else "medium",
             service_key=f"kanal_{kanal}", target_node="10", owner="shadow",
-            evidence=(f"{kanal}: {n} gotowych do publikacji, a ostatnia udana "
-                      + (f"{cisza / 3600:.0f} h temu ({_iso(ost)})" if ost else "— brak w 90 dniach")
-                      + (f"; {blad[kanal]} czeka na operatora po błędzie ręki" if blad.get(kanal) else ""))))
+            evidence=evidence))
     notes = [f"kanały: gotowe {sum(gotowe.values())}, czeka na operatora {sum(blad.values())}, "
-             f"stoi {len(faults)}"]
+             f"prób w 7 dniach {sum(len(v) for v in proby.values())}, stoi {len(faults)}"]
     return faults, notes
 
 
@@ -914,6 +957,9 @@ PUSH_GOTOWY_PL = (9, 15)            # okno pushu 7:15–9:00 PL + zapas
 IB_TAX_TICK_MAX_S = 26 * 3600       # tick raz na dobę
 KSEF_TICK_MAX_S = 14 * 3600         # tick co 6 h
 KSEF_FV_MAX_DNI_ROBOCZYCH = 4
+# 2026-11-05: ksef_pobierz ok=False od 13.10 i nikt nie wiedział — brak UDANEGO pobrania
+# dłużej niż 3 dni robocze to high (przebieg ≠ sukces).
+KSEF_SUKCES_MAX_DNI_ROBOCZYCH = 3
 
 
 def _brain_modes_ro(prefiksy: tuple[str, ...]) -> dict[str, str]:
@@ -976,7 +1022,7 @@ async def _jpk(teraz: datetime) -> tuple[list[dict], list[str]]:
     if po:
         faults.append(_fault(
             key="firma:jpk_po_terminie", probe="petle_firmy", czesc="ib_tax", kind="firm_tax_overdue",
-            severity="medium", service_key="ib_tax_po_terminie", target_node="10", owner="operator",
+            severity="high", service_key="ib_tax_po_terminie", target_node="10", owner="operator",
             evidence="Instal Busters po terminie: " + ", ".join(
                 f"{o.kod} (termin {o.termin.isoformat()}{', deklarowane bez UPO' if o.kod in dekl else ''})"
                 for o in po)))
@@ -992,13 +1038,24 @@ async def _jpk(teraz: datetime) -> tuple[list[dict], list[str]]:
 
 
 async def _ksef(teraz: datetime) -> tuple[list[dict], list[str]]:
+    from zoneinfo import ZoneInfo
     bm = await asyncio.to_thread(_brain_modes_ro, ("ksef_",))
     ost = _z_iso(bm.get("ksef_ostatni_przebieg"))
-    if ost is None:
+    sukces_znacznik = _z_iso(bm.get("ksef_ostatni_sukces"))
+    sukces = sukces_znacznik or ost
+    if sukces is None:
         return [], ["KSeF: tick nie zapisał jeszcze znacznika (zapis od 30.09)"]
     faults: list[dict] = []
     wspolne = dict(probe="petle_firmy", czesc="ksef", target_node="10", owner="shadow")
-    if (teraz - ost).total_seconds() > KSEF_TICK_MAX_S:
+    strefa_pl = ZoneInfo("Europe/Warsaw")
+    dni_bez = _dni_robocze_miedzy(sukces.astimezone(strefa_pl).date(), teraz.astimezone(strefa_pl).date())
+    if dni_bez > KSEF_SUKCES_MAX_DNI_ROBOCZYCH:
+        faults.append(_fault(
+            key="firma:ksef_brak_sukcesu", kind="firm_ksef_no_success", severity="high",
+            service_key="ksef_sukces",
+            evidence=(f"KSeF: brak udanego pobrania zakupów od {_iso(sukces)} ({dni_bez} dni roboczych"
+                      f"{'' if sukces_znacznik else ', znacznik: ostatni przebieg'})"), **wspolne))
+    if ost is not None and (teraz - ost).total_seconds() > KSEF_TICK_MAX_S:
         faults.append(_fault(key="firma:ksef_tick", kind="firm_loop_stalled", severity="medium",
                              service_key="ksef_tick", evidence=f"pobieranie zakupów z KSeF stoi od {_iso(ost)}",
                              **wspolne))
@@ -1012,7 +1069,8 @@ async def _ksef(teraz: datetime) -> tuple[list[dict], list[str]]:
                 key="firma:ksef_lista", kind="firm_ksef_list_stale", severity="low", service_key="ksef_lista",
                 evidence=(f"najnowsza faktura zakupowa z KSeF: {d_fv.isoformat()} ({dni} dni roboczych) — "
                           "lista stoi albo naprawdę nie było zakupów"), **wspolne))
-    return faults, [f"KSeF: przebieg {_iso(ost)}, najnowsza FV {fv or '?'}"]
+    return faults, [f"KSeF: przebieg {_iso(ost) if ost else '?'}, sukces {_iso(sukces)}, "
+                    f"najnowsza FV {fv or '?'}"]
 
 
 # Filtr echa działa od restartu 30.09 19:27:50Z — wcześniejsze wpisy to stare echo, nie nawrót.
@@ -1416,9 +1474,94 @@ def _ile_czasu(od_iso: Any, do: datetime) -> str:
     return f"{s / 3600:.1f} h"
 
 
+# ── DZIENNY ZBIÓR WA (pętle firmowe) ─────────────────────────────────────────
+# 2026-11-05: KSeF, JPK i push serwisu stały tygodniami jako „medium” w pamięci, a alarm szedł
+# tylko przy high i tylko na Discord. Raz dziennie po 10:00 PL operator dostaje JEDNĄ wiadomość WA.
+ZBIOR_WA_GODZINA_PL = 10
+ZBIOR_WA_ZNACZNIK = "zbior_wa_dzien"
+_CO_ZROBIC_FIRMA = {
+    "firm_tax_overdue": "złóż zaległą deklarację/JPK (bramka MF / e-Deklaracje) i dopilnuj UPO",
+    "firm_ksef_no_success": "sprawdź token/uprawnienia KSeF i log ticku ksef_pobierz, potem pobierz ręcznie",
+    "firm_loop_stalled": "tick pętli nie chodzi — sprawdź scheduler i log backendu, uruchom tick ręcznie",
+    "firm_loop_push_missed": "sprawdź most WA i wyślij poranny push serwisu ręcznie",
+    "firm_ksef_list_stale": "sprawdź w KSeF, czy są nowe faktury zakupowe i czy tick je zapisuje",
+    "firm_calendar_echo": "sprawdź filtr whatsapp._kalendarz_pomija (numery mostu)",
+    "probe_unknown": "sonda nie zmierzyła — sprawdź log organism_probes i dostęp do bazy",
+}
+
+
+def _firmowa(klucz: str, rec: dict[str, Any]) -> bool:
+    k = str(rec.get("key") or klucz)
+    return rec.get("probe") == "petle_firmy" or k.startswith(("firma:", "serwis_push:"))
+
+
+def _co_zrobic(rec: dict[str, Any]) -> str:
+    return (_CO_ZROBIC_FIRMA.get(str(rec.get("kind") or ""))
+            or rec.get("suggested_action") or "sprawdź ręcznie i zdecyduj")
+
+
+def tekst_zbioru_wa(usterki: dict[str, dict]) -> tuple[str, int]:
+    """Aktywne usterki pętli firmowych → (tekst, liczba punktów). High pierwsze."""
+    wybrane = [(k, r) for k, r in (usterki or {}).items()
+               if isinstance(r, dict) and r.get("status") in STATUSY_AKTYWNE and _firmowa(k, r)]
+    if not wybrane:
+        return "", 0
+    wybrane.sort(key=lambda kr: (_WAGA.get(str(kr[1].get("severity")), 3), str(kr[1].get("key") or kr[0])))
+    linie = [f"Shadow — pętle firmowe stoją ({len(wybrane)}):"]
+    for i, (k, r) in enumerate(wybrane, 1):
+        linie.append(f"{i}. [{str(r.get('severity') or '?').upper()}] {r.get('evidence') or r.get('key') or k}"
+                     f"\n   co zrobić: {_co_zrobic(r)}")
+    return "\n".join(linie), len(wybrane)
+
+
+async def _wyslij_wa_operatorowi(tekst: str) -> bool:
+    import inspect
+    from app.services.wa_documents import OPERATOR_WA, send_wa_text
+    res = send_wa_text(OPERATOR_WA, tekst, discord_zapas=False)
+    if inspect.isawaitable(res):
+        res = await res
+    return isinstance(res, dict) and res.get("sent") is True
+
+
+async def zbior_dzienny_wa(pamiec: dict[str, Any], *, teraz: Optional[datetime] = None,
+                           wyslij_wa: Optional[Callable[[str], Awaitable[bool]]] = None) -> dict[str, Any]:
+    """Pierwszy tick po 10:00 PL: jedna wiadomość WA. Znacznik dnia TYLKO po udanej wysyłce."""
+    from zoneinfo import ZoneInfo
+    teraz = teraz or _teraz()
+    pl = teraz.astimezone(ZoneInfo("Europe/Warsaw"))
+    dzien = pl.date().isoformat()
+    if pl.hour < ZBIOR_WA_GODZINA_PL:
+        return {"wyslano": False, "pozycji": 0, "tekst": "", "powod": "przed 10:00 PL"}
+    if pamiec.get(ZBIOR_WA_ZNACZNIK) == dzien:
+        return {"wyslano": False, "pozycji": 0, "tekst": "", "powod": "dziś już wysłany"}
+    tekst, n = tekst_zbioru_wa(pamiec.get("usterki") or {})
+    if not n:
+        return {"wyslano": False, "pozycji": 0, "tekst": "", "powod": "brak aktywnych usterek pętli firmowych"}
+    ok, res = await _z_limitem((wyslij_wa or _wyslij_wa_operatorowi)(tekst), T_WYSYLKA)
+    poszlo = bool(ok and res is True)
+    if poszlo:
+        pamiec[ZBIOR_WA_ZNACZNIK] = dzien
+    else:
+        logger.warning("[organism_probes] zbiór WA NIE wyszedł (%s) — spróbuję w następnym ticku", res)
+    return {"wyslano": poszlo, "pozycji": n, "tekst": tekst, "powod": "" if poszlo else f"wysyłka WA: {res}"}
+
+
+async def _zbior_wa_bez_wyjatkow(zmiany: dict[str, Any], teraz: datetime,
+                                 wyslij_wa: Optional[Callable[[str], Awaitable[bool]]]) -> dict[str, Any]:
+    try:
+        return await zbior_dzienny_wa(zmiany.get("pamiec") or {}, teraz=teraz, wyslij_wa=wyslij_wa)
+    except Exception as exc:  # noqa: BLE001 — WA nie może zabić alarmu Discord (non-fatal)
+        logger.warning("[organism_probes] zbiór WA padł (non-fatal): %s", exc)
+        return {"wyslano": False, "pozycji": 0, "tekst": "", "powod": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+
 async def alarmuj(zmiany: dict[str, Any], wyslij: Callable[[str], Awaitable[bool]], *,
-                  teraz: Optional[datetime] = None) -> dict[str, Any]:
+                  teraz: Optional[datetime] = None,
+                  wyslij_wa: Optional[Callable[[str], Awaitable[bool]]] = None) -> dict[str, Any]:
     """Jedna zbiorcza wiadomość o NOWYCH usterkach high, USTĄPIENIACH i remediach, które NIE POMOGŁY.
+
+    Po Discordzie: dzienny zbiór WA pętli firmowych (zbior_dzienny_wa; wyslij_wa=None → send_wa_text
+    do OPERATOR_WA). Błąd WA ląduje w wyniku["wa"], nie przerywa alarmu.
 
     `wyslij` przychodzi z zewnątrz (w ticku: scheduler._discord_say). alarm_ts ustawiamy TYLKO,
     gdy wysyłka oddała True — awaria kanału nie kasuje alarmu (lekcja „awaria mózgu nie kasuje
@@ -1457,7 +1600,9 @@ async def alarmuj(zmiany: dict[str, Any], wyslij: Callable[[str], Awaitable[bool
                          f"{rec.get('remedium_ts') or '?'}, usterka trwa: {str(rec.get('evidence'))[:160]}")
             pozycje.append((rec, typ, linia))
     if not pozycje:
-        return {"wyslano": False, "pozycji": 0, "tekst": "", "powod": "nic do zgłoszenia"}
+        wynik = {"wyslano": False, "pozycji": 0, "tekst": "", "powod": "nic do zgłoszenia"}
+        wynik["wa"] = await _zbior_wa_bez_wyjatkow(zmiany, teraz, wyslij_wa)
+        return wynik
 
     kolejnosc = {"nie_pomoglo": 0, "nowa": 1, "ustapila": 2}
     pozycje.sort(key=lambda x: kolejnosc.get(x[1], 3))
@@ -1488,8 +1633,10 @@ async def alarmuj(zmiany: dict[str, Any], wyslij: Callable[[str], Awaitable[bool
                 rec["epizod_alarmowany"] = True
     else:
         logger.warning("[organism_probes] alarm NIE wyszedł (%s) — zostaje na następny tick", res)
-    return {"wyslano": poszlo, "pozycji": len(wyslane), "tekst": tekst,
-            "powod": "" if poszlo else f"wysyłka: {res}"}
+    wynik = {"wyslano": poszlo, "pozycji": len(wyslane), "tekst": tekst,
+             "powod": "" if poszlo else f"wysyłka: {res}"}
+    wynik["wa"] = await _zbior_wa_bez_wyjatkow(zmiany, teraz, wyslij_wa)
+    return wynik
 
 
 # ── SAMODZIELNY POMIAR ───────────────────────────────────────────────────────
@@ -1511,7 +1658,14 @@ async def _main() -> None:
     async def _atrapa(t: str) -> bool:
         zapisane.append(t)
         return True
-    al = await alarmuj(zm, _atrapa)
+    zapisane_wa: list[str] = []
+
+    async def _atrapa_wa(t: str) -> bool:
+        zapisane_wa.append(t)
+        return True
+    al = await alarmuj(zm, _atrapa, wyslij_wa=_atrapa_wa)
+    if zapisane_wa:
+        print("\n--- ZBIÓR WA (atrapa, nic nie wysłano) ---\n" + zapisane_wa[0])
     print("\n--- DECYZJA (atrapa wysyłki, pamięć w RAM, nic nie zapisano) ---")
     print(f"nowe={len(zm['nowe'])} do_zaproponowania={len(do_zaproponowania(wynik['faults'], zm['pamiec']))} "
           f"alarm_pozycji={al['pozycji']}")

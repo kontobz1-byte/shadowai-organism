@@ -39,11 +39,27 @@ Organizm składa się z **rąk** (moduły wykonujące zadania: publikacje, mail,
 - **Samoaudyt organizmu** (`src/organizm/organism_probes.py`). Sondy usług, nasłuchów, kopii, pętli i kanałów; usterki z ważnością,
   napięcia i remedia.
 
-## Uczciwie: czego jeszcze brakuje (audyt 05.11.2026)
+- **Router modeli po węzłach** (`src/router/ollama_router.py`). Model idzie tam, gdzie ma realnie miejsce; zapas przy awarii,
+  reguły węzłów (np. węzeł rozmowy trzyma tylko mały model), budżet czasu.
+- **Pamięć rozmowy i napięcia** (`src/pamiec/operator_memory.py`, `src/organizm/tension_engine.py`, `src/rag/rag_service.py`).
+  Warstwy pamięci operatora z korektami i świeżością; napięcia wykrywają sprzeczne odpowiedzi, ale blokują tylko akcję, nie polecenie.
+- **Zwiad organizmu** (`src/organizm/zwiad_organizmu_hand.py`, `zwiad_wezlow_hand.py`). Zanim Shadow powie „nie ma”, szuka w sobie
+  i na maszynach sieci; `odbior_2_hand.py` to ręka napisana w całości przez kuźnię (produkt na dysk operatora + dowód co do bajta).
+- **Magazyny i nagrania** (`src/magazyn/`). Nagrania z maszyn trafiają na trzy dyski wybierane trójkątem; oryginał znika dopiero po
+  zgodnym SHA256 kopii; straż gry — nic nie kopiuje, gdy ktoś gra.
+- **Teledyski — artistic flow** (`src/teledysk/`, `docs/ZASADY_ARTISTIC_FLOW.md`). Inspiracje → pomysł → sceny partiami → plan
+  reżyserski (autor + krytyk, „stuki” cięć na słowach tekstu) → kadry z kontrolą wizji → ruch Wan na kilku węzłach.
+- **Shorty i OKO MASZYNY** (`src/shorty/`). Shorty PL/EN z klipów gry z tytułami z klatek (model wizji); seria, w której maszyna
+  typuje, co stanie się w klipie, a tablica liczy OKO kontra gracz.
+- **Merch** (`src/merch/`). Fabryka print-on-demand: hasło → pliki do druku → oferty na platformy (z bramką operatora).
+
+## Uczciwie: czego jeszcze brakuje (audyt 05.11.2026, aktualizacja 09.11)
 
 - Jeden żywy rejestr organów — dziś organy znają siebie częściowo (rejestr melduje 1 z ~231 organów, listy są ręczne).
 - Człon PRZESZŁOŚCI trójkąta uczy się z małej części trajektorii, a energia (W, PV, taryfa) nie wchodzi jeszcze do kosztu.
 - Część pętli pisze sygnały, których nikt nie czyta (decyzje debat, zadania debug) — w budowie most „porażka → zamówienie w kuźni”.
+- Ręce często znają tylko jedno źródło (jedną maszynę, jeden format) — 08–09.11 kuźnia poprawiła m.in. shorty (32:9, tytuły z
+  obrazu), nagrania (katalogi NVIDIA z pomiaru) i kierowanie zdań w rozmowie; to stały kierunek prac.
 
 ## Prywatność i bezpieczeństwo
 

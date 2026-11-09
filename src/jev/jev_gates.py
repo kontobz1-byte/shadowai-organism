@@ -118,9 +118,9 @@ GATES: dict[str, Question] = {
                  "render .130 (montaż, wideo, GPU)", "operator (człowiek decyduje)"],
         margin=0.20),
 
-    # 31.10 (operator: „nic hardcoded, trójkąty, areny, JEV”): montaz_rodzinny wołał montage_jasio na sztywno
+    # 31.10 (operator: „nic hardcoded, trójkąty, areny, JEV”): montaz_rodzinny wołał montage_dziecko na sztywno
     # z --styl nooby_rodzice, a tego wieczoru Dziecko grał obok taty i mówił do mikrofonu. Pierwsze słowo opcji =
-    # nazwa stylu montage_jasio (skrypt bierze z niej styl i listę dozwolonych --styl). Klucz stały (kalibracja).
+    # nazwa stylu montage_dziecko (skrypt bierze z niej styl i listę dozwolonych --styl). Klucz stały (kalibracja).
     # 31.10 03:46Z (pomiar Claude): gemma4 przy choice otwierała kanał myślenia → abstain, dist {}. bez_myslenia=True
     # przywraca odruch; margin 0.5 posyła niejasne stany (pewność 0.33–0.46) do Systemu 2 przez decide(.
     "styl_montazu_rodzinnego": Question(

@@ -945,6 +945,11 @@ _TRAJ_OKNO = 8          # ile ostatnich zdarzeń per node bierzemy pod uwagę
 _CTL_PROG = 3           # tyle porażek z rzędu = closed timelike loop → sygnał BREAK
 _POLOWA_ZANIKU_H = 24.0  # po tylu godzinach skutek waży o połowę mniej (rozpad połowiczny)
 _KV_REZYDENTA_GB = 0.5  # model już w pamięci węzła potrzebuje tylko zapasu na kontekst/KV, nie całej wagi
+# 2026-11-06: przeprowadzka modelu na inny węzeł nie jest darmowa (pomiar 7 dni do 05.11: gemma4:12b
+# 260 zmian węzła na 506 sukcesów, 23 powroty A→B→A w 15 min; qwen3.8:27b 30). Węzeł inny niż obecne
+# miejsce modelu kosztuje ×_KOSZT_PRZEPROWADZKI, a powrót na poprzedni węzeł przed _POSTOJ_S jest wykluczony.
+_KOSZT_PRZEPROWADZKI = 1.5
+_POSTOJ_S = 900.0
 # Kanały, którymi free_gb płynie RAZEM z telemetrią hosta. Tylko dla nich nieświeżość
 # hosta jest nieświeżością liczby, na której opieramy decyzję.
 _KANALY_Z_TELEMETRII_HOSTA = {"winrm-cim", "nvidia-smi-winrm"}
@@ -997,13 +1002,70 @@ def _traj_wpisy(node_key: str, limit: int = _TRAJ_OKNO,
                 continue
             if need_gb is not None:
                 recorded_need = e.get("need_gb")
-                if (type(recorded_need) not in (int, float)
+                # Wpis `ok` bez need_gb (router zapisywał None) pasuje do każdej klasy zadań:
+                # węzeł, który zrobił robotę, jest dowodem zdrowia. Bez tego ~86% dziennika
+                # (sukcesy) nie wpływało na żadną decyzję, a człon przeszłości widział same porażki.
+                if recorded_need is None and e.get("outcome") == "ok":
+                    pass
+                elif (type(recorded_need) not in (int, float)
                         or not recorded_need >= 0.5 * need_gb):
                     continue
             out.append(e)
             if len(out) >= limit:
                 break
     return list(reversed(out))
+
+
+def _miejsce_modelu(model: Optional[str], klucze) -> Optional[dict[str, Any]]:
+    """Gdzie model siedzi wg dziennika: sukcesy routera (outcome ok, note „…: <model>”).
+
+    None = brak danych (brak pliku, brak wpisów) albo najnowszy wpis starszy niż _POSTOJ_S.
+    Inaczej {obecny, przyjazd, poprzedni}: węzeł najnowszego wpisu, ts najstarszego wpisu w nieprzerwanej
+    serii najnowszych wpisów na tym węźle, węzeł pierwszego starszego wpisu z innym węzłem (albo None).
+    """
+    if not model:
+        return None
+    klucze = {str(k) for k in (klucze or ())}
+    try:
+        import json as _j
+        with open(_LEDGER, "r", encoding="utf-8", errors="replace") as fh:
+            wiersze = fh.readlines()[-2000:]
+    except Exception:
+        return None
+    koncowka = f": {model}"
+    obecny = None
+    przyjazd = None
+    najnowszy_ts = None
+    poprzedni = None
+    for w in reversed(wiersze):
+        w = w.strip()
+        if not w:
+            continue
+        try:
+            e = _j.loads(w)
+            if not isinstance(e, dict):
+                continue
+            if e.get("outcome") != "ok" or str(e.get("node")) not in klucze:
+                continue
+            if not str(e.get("note") or "").endswith(koncowka):
+                continue
+            ts = float(e.get("ts"))
+        except Exception:
+            continue
+        wezel = str(e.get("node"))
+        if obecny is None:
+            obecny, przyjazd, najnowszy_ts = wezel, ts, ts
+            continue
+        if wezel == obecny:
+            przyjazd = ts
+            continue
+        poprzedni = wezel
+        break
+    if obecny is None or najnowszy_ts is None:
+        return None
+    if time.time() - najnowszy_ts > _POSTOJ_S:
+        return None
+    return {"obecny": obecny, "przyjazd": przyjazd, "poprzedni": poprzedni}
 
 
 def _trajectory(node_key: str, need_gb: float | None = None) -> dict[str, Any]:
@@ -1014,7 +1076,10 @@ def _trajectory(node_key: str, need_gb: float | None = None) -> dict[str, Any]:
     wykładniczo — po `_CTL_PROG` porażkach organizm ma przestać tam wracać (BREAK), zamiast
     rotować wokół zepsutego węzła i za każdym razem uznawać to za lokalnie sensowne.
     """
-    wpisy = _traj_wpisy(node_key, outcomes=("ok", "fail", "timeout"), need_gb=need_gb)
+    # `timeout` (uczeń kuźni nie zmieścił się w budżecie) liczy się MODELOWI, nie węzłowi:
+    # węzeł, który wisi naprawdę, zapisuje router jako `fail` (mark_runner_failed). Liczenie
+    # timeoutów ucznia jako porażek węzła wpędzało zdrowe .172 w CTL (BREAK przy need_gb=8).
+    wpisy = _traj_wpisy(node_key, outcomes=("ok", "fail"), need_gb=need_gb)
     if not wpisy:
         return {"retro": 1.0, "ctl": False, "opis": "brak historii (neutralnie)"}
     # Porażki z rzędu liczone od najświeższej, ale WAŻONE wiekiem — licznik jest ułamkowy,
@@ -1196,13 +1261,19 @@ def pick_node(nodes: list[dict[str, Any]], need_gb: float,
     rozkład kosztów (bezcenny log do nauki Shadow).
     """
     # BRAMKA OPERATORA (twarda, nie koszt): operator gra na .253 → wyklucz, ustąp GPU.
-    # is_win_available()=False gdy vram_manager.set_gaming_mode(True). Człowiek > optymalizacja.
-    win_blocked = False
+    # require_inference=False (Wan/ComfyUI): wyklucza TYLKO gra lub rezerwacja operatora.
+    #   Wan na .253 sam gasi Ollamę na czas liczenia — to NIE jest gaming-mode.
+    # require_inference=True: dodatkowo is_win_available() (Ollama wyłączona).
+    _win_gaming = False
+    _win_reserved = False
+    _win_ollama_off = False
     try:
-        from app.services.vram_manager import is_win_available
-        win_blocked = not is_win_available()
+        from app.services.vram_manager import is_gaming_now, win_zarezerwowany, is_win_available
+        _win_gaming = is_gaming_now()
+        _win_reserved = win_zarezerwowany()
+        _win_ollama_off = (not is_win_available()) and not _win_gaming and not _win_reserved
     except Exception:
-        win_blocked = False
+        pass
 
     guest_blocked = False
     try:
@@ -1220,11 +1291,22 @@ def pick_node(nodes: list[dict[str, Any]], need_gb: float,
                            "temp_c": n.get("temp_c"), "transport_cost": math.inf,
                            "reason": f"WYKLUCZONY: brak runtime modeli ({n.get('role') or 'nie-inference'})"})
             continue
-        if n.get("node") == "253" and win_blocked:
-            scored.append({"node": "253", "gpu": n.get("gpu"), "free_gb": n.get("free_gb"),
-                           "temp_c": n.get("temp_c"), "transport_cost": math.inf,
-                           "reason": "WYKLUCZONY: gaming-mode (.253 należy do operatora)"})
-            continue
+        if n.get("node") == "253":
+            if _win_gaming:
+                scored.append({"node": "253", "gpu": n.get("gpu"), "free_gb": n.get("free_gb"),
+                               "temp_c": n.get("temp_c"), "transport_cost": math.inf,
+                               "reason": "WYKLUCZONY: gra operatora na .253"})
+                continue
+            if _win_reserved:
+                scored.append({"node": "253", "gpu": n.get("gpu"), "free_gb": n.get("free_gb"),
+                               "temp_c": n.get("temp_c"), "transport_cost": math.inf,
+                               "reason": "WYKLUCZONY: .253 wycofany z pełnej mocy, operator przy maszynie"})
+                continue
+            if require_inference and _win_ollama_off:
+                scored.append({"node": "253", "gpu": n.get("gpu"), "free_gb": n.get("free_gb"),
+                               "temp_c": n.get("temp_c"), "transport_cost": math.inf,
+                               "reason": "WYKLUCZONY: Ollama .253 wyłączona"})
+                continue
         if n.get("node") == "130" and guest_blocked:
             scored.append({"node": "130", "gpu": n.get("gpu"), "free_gb": n.get("free_gb"),
                            "temp_c": n.get("temp_c"), "transport_cost": math.inf,
@@ -1233,6 +1315,33 @@ def pick_node(nodes: list[dict[str, Any]], need_gb: float,
         cost, breakdown = _transport_cost(n, need_gb, prefer_model)
         scored.append({"node": n["node"], "gpu": n.get("gpu"), "free_gb": n.get("free_gb"),
                        "temp_c": n.get("temp_c"), "transport_cost": cost, **breakdown})
+    # 2026-11-06: koszt przeprowadzki i minimalny postój (bez modelu i bez danych w dzienniku — bez zmian).
+    if prefer_model:
+        klucze_wej = {str(n.get("node")) for n in nodes
+                      if isinstance(n, dict) and n.get("node") is not None}
+        po_wezle = {str(s.get("node")): s for s in scored}
+        obecne = {str(s.get("node")) for s in scored
+                  if s["transport_cost"] != math.inf and s.get("warm", 1.0) < 1.0}
+        miejsce = _miejsce_modelu(prefer_model, klucze_wej)
+        if miejsce:
+            ob = po_wezle.get(str(miejsce["obecny"]))
+            if ob is not None and ob["transport_cost"] != math.inf:
+                obecne.add(str(miejsce["obecny"]))
+                poprz = miejsce.get("poprzedni")
+                minelo = time.time() - float(miejsce["przyjazd"])
+                if poprz is not None and minelo < _POSTOJ_S:
+                    sp = po_wezle.get(str(poprz))
+                    if (sp is not None and sp["transport_cost"] != math.inf
+                            and sp.get("warm", 1.0) == 1.0):
+                        sp["transport_cost"] = math.inf
+                        sp["reason"] = (f"WYKLUCZONY: postój — model przyjechał na {miejsce['obecny']} "
+                                        f"{int(max(0.0, minelo))} s temu z {poprz}, powrót najwcześniej "
+                                        f"po {_POSTOJ_S / 60:g} min")
+        if obecne:
+            for s in scored:
+                if str(s.get("node")) not in obecne and s["transport_cost"] != math.inf:
+                    s["transport_cost"] = s["transport_cost"] * _KOSZT_PRZEPROWADZKI
+                    s["przeprowadzka"] = _KOSZT_PRZEPROWADZKI
     fit = [s for s in scored if s["transport_cost"] != math.inf]
     if not fit:
         return {"decision": None, "reason": f"żaden node nie ma {need_gb}GB wolnego",
