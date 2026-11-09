@@ -7,7 +7,11 @@
 
 ## Wizja
 
-> _Do uzupełnienia przez operatora — nowa wizja (05.11.2026: „potem będzie blackout i nowa wizja”)._
+> „Energooszczędne trenowanie, zewnętrzna baza danych z lokalnymi modelami jako punkty styku i przekierowanie strzału — trenowanie bez treningu, rozproszony organizm.” — operator, 08.11.2026
+>
+> Cel: AGI mierzone tymi samymi miarami co modele największych laboratoriów, ale z szybkością wynikającą z architektury (eskalacja, routing, kuźnia), a nie z wielkości jednego modelu.
+
+English version: [README.en.md](README.en.md)
 
 ## Czym jest Shadow
 
@@ -70,4 +74,4 @@ Brak `.env`, baz, danych klientów i rodziny.
 ## Status i licencja
 
 Wyciąg do pokazania architektury — moduły zależą od prywatnego backendu i nie uruchomią się samodzielnie.
-Licencja: **do decyzji operatora** (przed publikacją).
+Licencja: **Apache 2.0** (`LICENSE`). Nazwa i identyfikacja wizualna ShadowAI nie są objęte licencją (`NOTICE`).
