@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/img/shadowai_logo.png" alt="ShadowAI — Local · Sovereign · Made in Poland" width="560"></p>
+
 # ShadowAI — a distributed, local-first AI organism
 
 ShadowAI is one "organism" spread across several computers on a home network. It builds its own tools ("hands") through a *forge*

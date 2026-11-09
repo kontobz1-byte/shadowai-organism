@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/img/shadowai_logo.png" alt="ShadowAI — Lokalny · Suwerenny · Made in Poland" width="560"></p>
+
 # ShadowAI — rozproszony organizm AI (local-first)
 
 > **EN:** ShadowAI is a local-first, distributed "AI organism" running on a home LAN of six machines. It builds its own tools
